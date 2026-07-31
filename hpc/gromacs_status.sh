@@ -20,6 +20,7 @@
 #        --no-mpi-err        Do not parse MPI/parallel errors
 #        --no-slurm-out      Do not read SLURM .out file for progress info
 #        --no-disk           Do not compute disk usage per simulation
+#        --debug-discovery   Print why each candidate dir was accepted/rejected
 #        --time-unit UNIT    Display time in: ps / ns / us  (default: auto)
 #        --dt VAL            Integration timestep in ps (default: 0.02 ps = 20 fs)
 #                            Used to convert steps → simulation time
@@ -72,6 +73,7 @@ TIME_UNIT="auto"
 DT_PS="0.02"          # 20 fs — standard MARTINI CG; override with --dt
 ERR_LINES=3
 LOG_DIR="./md_status_logs"
+DEBUG_DISCOVERY=0
 declare -a EXCLUDE_PATTERNS=()  # shell glob patterns to exclude from discovery
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
@@ -87,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         --no-mpi-err)       PARSE_MPI_ERR=0;    shift   ;;
         --no-slurm-out)     READ_SLURM_OUT=0;   shift   ;;
         --no-disk)          SHOW_DISK=0;         shift   ;;
+        --debug-discovery)  DEBUG_DISCOVERY=1;   shift   ;;
         --time-unit)        TIME_UNIT="$2";      shift 2 ;;
         --dt)               DT_PS="$2";          shift 2 ;;
         --err-lines)        ERR_LINES="$2";      shift 2 ;;
@@ -181,9 +184,12 @@ unset _old_logs _f
 
 exec 3>"$LOGFILE"
 exec > >(tee -a "$LOGFILE") 2>/dev/null
+# fd 4 = a copy of the real stdout, so diagnostics emitted from inside
+# command substitutions (whose stdout is captured) still reach the user.
+exec 4>&1
 
 # Trap Ctrl+C and errors — ensure tee child and any open fds are closed cleanly
-trap 'exec 3>&- 2>/dev/null; exit 130' INT TERM
+trap 'exec 3>&- 4>&- 2>/dev/null; exit 130' INT TERM
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SLURM SNAPSHOT — query once, use for all dirs (avoids per-dir squeue calls)
@@ -346,19 +352,126 @@ discover_sim_dirs() {
         done
         [[ $_skip -eq 1 ]] && continue
 
-        # Require the directory to contain at least one unambiguous GROMACS file
-        # (*.tpr, *.edr, *.xtc, *.trr, *.cpt, confout.gro) OR a SLURM log file
-        # matching the configured prefix (job submitted but not yet started).
-        local is_sim=0
-        for ext in tpr edr xtc trr cpt; do
-            if [[ -n "$(find "$d" -maxdepth 1 -name "*.${ext}" 2>/dev/null | head -1)" ]]; then
-                is_sim=1; break
+        # Require the directory to contain at least one file matching the
+        # CONFIGURED PATTERN (${SIM_PATTERN}.tpr/.log/.xtc/.trr/.cpt/.edr,
+        # confout.gro, or ${SIM_PATTERN}*.gro) OR a SLURM log file matching
+        # the configured prefix that squeue confirms is a live/pending job.
+        #
+        # NOTE: this must mirror find_by_ext/find_sim_log/find_sim_xtc exactly.
+        # A generic *.ext check here (regardless of pattern) would let a
+        # directory slip into SIM_DIRS just because it holds some unrelated
+        # file sharing an extension (e.g. a post-processing/"outcomes" folder
+        # with a leftover copy of a trajectory) — that dir then shows every
+        # column as "○" and any stray text matched by the generic error
+        # scanners gets misreported as a FAILED/INCOMPLETE simulation even
+        # though it isn't one. Likewise, a bare "<prefix>.err.<jobid>" file
+        # does NOT by itself prove this is an MD run for this pattern — that
+        # naming convention can be reused by cleanup/rsync/analysis jobs — so
+        # it only counts when squeue confirms the job ID is real.
+        # The GATE: a directory is a simulation directory only if GROMACS
+        # demonstrably ran (or is about to run) there. The anchor for this is
+        # a .tpr (run input) or a GROMACS .log (written from the first step of
+        # mdrun onward). Without either, the tool has nothing to read — every
+        # data column comes out "-" — and any .err/.out found there belongs to
+        # some other job. Trajectory/checkpoint/energy files alone are NOT an
+        # anchor: those are exactly what people copy into post-processing and
+        # analysis folders ("outcomes", "movie", stripped trajectories, test
+        # slices), which is how such folders used to end up reported as FAILED
+        # simulations with an unrelated job's errors attached.
+        local is_sim=0 _reason=""
+        local _anchor_tpr="" _anchor_log=""
+        if [[ -n "$SIM_PATTERN" ]]; then
+            _anchor_tpr=$(find "$d" -maxdepth 1 -name "${SIM_PATTERN}.tpr" 2>/dev/null | head -1)
+            _anchor_log=$(find "$d" -maxdepth 1 -name "${SIM_PATTERN}.log" 2>/dev/null | head -1)
+        else
+            _anchor_tpr=$(find "$d" -maxdepth 1 -name "*.tpr" 2>/dev/null | head -1)
+            # In wildcard mode exclude SLURM logs (<prefix>.err.<id>/.out.<id>)
+            # from counting as a GROMACS log.
+            _anchor_log=$(find "$d" -maxdepth 1 -type f -name "*.log" 2>/dev/null \
+                | grep -vE '\.(err|out)\.[0-9]+$' | head -1)
+        fi
+
+        if [[ -n "$_anchor_tpr" ]]; then
+            # A .tpr is definitive on its own: it is the GROMACS run-input
+            # file, produced by grompp in the run directory, and it is not
+            # something that gets copied into an analysis folder.
+            is_sim=1; _reason="tpr:$(basename "$_anchor_tpr")"
+        elif [[ -n "$_anchor_log" ]]; then
+            # A GROMACS log without a .tpr (e.g. the .tpr was cleaned up after
+            # the run) still proves mdrun ran here — but require one more
+            # corroborating output so that a stray analysis log doesn't count.
+            local _corrob=0
+            if [[ -n "$SIM_PATTERN" ]]; then
+                for ext in cpt edr xtc trr; do
+                    [[ -n "$(find "$d" -maxdepth 1 -name "${SIM_PATTERN}.${ext}" 2>/dev/null | head -1)" ]] && (( _corrob++ ))
+                done
+                if [[ -f "$d/confout.gro" ]] || \
+                   [[ -n "$(find "$d" -maxdepth 1 -name "${SIM_PATTERN}*.gro" 2>/dev/null | head -1)" ]]; then
+                    (( _corrob++ ))
+                fi
+            else
+                # Wildcard: corroborating files must share the log's basename,
+                # so an unrelated trajectory sitting next to an unrelated log
+                # does not add up to a simulation.
+                local _stem; _stem=$(basename "$_anchor_log"); _stem="${_stem%.log}"
+                for ext in cpt edr xtc trr gro; do
+                    [[ -e "$d/${_stem}.${ext}" ]] && (( _corrob++ ))
+                done
+                [[ -f "$d/confout.gro" ]] && (( _corrob++ ))
             fi
-        done
-        [[ -f "$d/confout.gro" ]] && is_sim=1
-        # Accept dirs with a SLURM log — job submitted, files not yet created
+            if (( _corrob >= 1 )); then
+                is_sim=1; _reason="log:$(basename "$_anchor_log")+${_corrob}"
+            fi
+        fi
+        # Accept dirs with ONLY a SLURM log and nothing else (job submitted,
+        # GROMACS has not created any output yet). This must stay narrow:
+        # a directory that already holds other content — post-processing
+        # scripts, analysis subfolders, .pdb files, extra trajectories, etc.
+        # — is clearly an established directory, not a pristine pre-grompp
+        # one, even if it happens to contain a .err/.out that shares the
+        # configured SLURM prefix (e.g. a post-processing job submitted
+        # with the same naming convention as the production run). So this
+        # fallback only fires when the SLURM log(s) are the ONLY entries in
+        # the directory; otherwise a same-prefix log from an unrelated job
+        # must not be enough to call the directory a simulation.
         if [[ $is_sim -eq 0 ]]; then
-            [[ -n "$(find "$d" -maxdepth 1 -type f                 -name "${SLURM_PREFIX}.err.*" -o                 -name "${SLURM_PREFIX}.out.*" 2>/dev/null | head -1)" ]] && is_sim=1
+            local -a _slurm_matches=()
+            while IFS= read -r _f; do _slurm_matches+=("$_f"); done \
+                < <(find "$d" -maxdepth 1 -type f \( -name "${SLURM_PREFIX}.err.*" -o -name "${SLURM_PREFIX}.out.*" \) 2>/dev/null)
+
+            if [[ ${#_slurm_matches[@]} -gt 0 ]]; then
+                local _total_entries _other_entries
+                _total_entries=$(find "$d" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+                _other_entries=$(( _total_entries - ${#_slurm_matches[@]} ))
+                if [[ $_other_entries -eq 0 ]]; then
+                    local _slurm_f _slurm_jid
+                    for _slurm_f in "${_slurm_matches[@]}"; do
+                        _slurm_jid=$(basename "$_slurm_f" | grep -oE "[0-9]+$")
+                        [[ -z "$_slurm_jid" ]] && continue
+                        if [[ $SLURM_AVAILABLE -eq 1 ]]; then
+                            [[ -n "${SLURM_JOBS[$_slurm_jid]+x}" ]] && {
+                                is_sim=1
+                                _reason="slurm-only:${_slurm_jid} (live in squeue)"
+                                break
+                            }
+                        else
+                            # squeue unavailable — an otherwise-empty dir with
+                            # just a matching log is still our best signal.
+                            is_sim=1
+                            _reason="slurm-only:${_slurm_jid} (squeue unavailable)"
+                            break
+                        fi
+                    done
+                fi
+            fi
+        fi
+
+        if [[ $DEBUG_DISCOVERY -eq 1 ]]; then
+            if [[ $is_sim -eq 1 ]]; then
+                echo "  DBG-ACCEPT  $d  [$_reason]" >&4
+            else
+                echo "  DBG-REJECT  $d  [no .tpr, no corroborated GROMACS .log]" >&4
+            fi
         fi
         [[ $is_sim -eq 0 ]] && continue
 

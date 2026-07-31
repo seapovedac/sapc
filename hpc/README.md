@@ -7,8 +7,8 @@ A terminal-based status explorer for GROMACS molecular dynamics simulations mana
 ## Features
 
 - **Three-path discovery** — no directory name assumptions:
-  - *Fingerprints*: `.tpr`, `.cpt`, `.edr`, `.xtc`, `.log` files at any depth.
-  - *SLURM logs*: `<prefix>.err.<jobid>` files — catches dirs where a job was submitted but GROMACS has not started yet.
+  - *Fingerprints*: `<pattern>.tpr` on its own is treated as confirmed evidence (the run-input file is never copied into an unrelated folder); without a `.tpr`, at least **two** matching pattern-named outputs (`.log`, `.cpt`, `.edr`, `.xtc`, `.trr`, `.gro`) are required — a single stray file (e.g. a trajectory copy left in a post-processing/analysis folder) is not enough to be counted as a simulation directory.
+  - *SLURM logs*: `<prefix>.err.<jobid>` / `<prefix>.out.<jobid>` files — catches dirs where a job was submitted but GROMACS has not started yet. Only counts when those SLURM log(s) are the **only** entries in the directory (no other files or subfolders) and, when `squeue` is available, the job ID is still live — so a log left behind by an unrelated job that happens to reuse the same SLURM prefix (e.g. a post-processing job) won't get a directory misclassified as a running simulation.
   - *squeue-guided*: for completely empty dirs, matches PD job names against directory names — finds jobs submitted before any file is created.
 - **SLURM-authoritative status** — calls `squeue` once at startup. Two matching strategies:
   - *Exact*: job ID from `.err` file found in squeue (running/just-started jobs).
@@ -93,6 +93,7 @@ The pattern (e.g. `9.production`) tells the script which files to read in each r
 | `--no-mpi-err` | on | Do not parse MPI/prterun error lines |
 | `--no-slurm-out` | on | Do not read `.out` file for progress/error info |
 | `--no-disk` | on | Skip `du -sh` (faster on slow filesystems) |
+| `--debug-discovery` | off | Print why each candidate directory was accepted or rejected |
 | `--time-unit UNIT` | auto | Force time unit: `ps`, `ns`, or `us` |
 | `--dt VAL` | `0.02` | Integration timestep in ps. Default = 20 fs (MARTINI CG). Use `0.002` for atomistic 2 fs runs. |
 | `--err-lines N` | `3` | Inline error context lines per error type. `0` = label only. |
@@ -259,6 +260,42 @@ If `squeue` is unavailable, the script falls back entirely to file-based heurist
 If your cluster names logs differently (e.g. `run.err.1234567`):
 ```bash
 ./gromacs_status.sh . -p 9.production --slurm-prefix run
+```
+
+### Post-processing / analysis subfolders (e.g. `outcomes`, `analysis`)
+A directory is only reported when GROMACS demonstrably ran (or is about
+to run) there. The anchor is a **`.tpr` or a GROMACS `.log`**:
+
+- **`.tpr` present** → accepted. It's the run-input file produced by
+  `grompp` in the run directory; it doesn't get copied into analysis
+  folders.
+- **`.log` but no `.tpr`** → accepted only with at least one
+  corroborating output (`.cpt`/`.edr`/`.xtc`/`.trr`/`.gro`) sharing the
+  log's basename. Covers runs whose `.tpr` was cleaned up.
+- **Neither** → rejected, *no matter how many trajectory, checkpoint or
+  energy files are present*. Those are exactly what gets copied into
+  post-processing folders, and without a `.tpr` or log there is nothing
+  to read anyway — every data column would come out as `-`.
+- A `<slurm-prefix>.err`/`.out` file only counts as "job submitted, not
+  started yet" when it's the **only** thing in the directory — a
+  post-processing job reusing the same SLURM prefix won't get its output
+  folder misclassified as a running simulation.
+
+Note this applies in wildcard mode (no `-p`) as well as with an explicit
+pattern.
+
+To see exactly why each candidate was accepted or rejected:
+```bash
+./gromacs_status.sh . -p 9.production --debug-discovery
+```
+```
+  DBG-ACCEPT  /scratch/proj/rep2            [tpr:9.production.tpr]
+  DBG-REJECT  /scratch/proj/rep2/outcomes   [no .tpr, no corroborated GROMACS .log]
+```
+
+If a subfolder still slips through, exclude it explicitly:
+```bash
+./gromacs_status.sh . -p 9.production -x outcomes -x analysis
 ```
 
 ### Final structure file detection
